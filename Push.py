@@ -38,6 +38,7 @@ RSSI_THRESHOLD = 65
 COOKIE_FILE = Path("cookie.txt")
 STATE_FILE = Path("zte_clients_state.json")
 EVENT_LOG = Path("target_events.log")
+STATUS_LOG = Path("target_status.log")
 URL = "http://192.168.5.1/?_type=vueData&_tag=vue_topo_data&Action=GetALLClients"
 EXTRA_HEADERS: Dict[str, str] = {}
 
@@ -134,6 +135,14 @@ def notify_status_change(is_online: bool) -> None:
     status_text = "UP" if is_online else "DOWN"
     send_pushplus_notification(content)
     send_webhook_notification(f"[{ts()}]+{status_text}")
+    log_status(f"[{ts()}] 状态变化：{status_text}")
+
+
+def notify_presence_change(is_present: bool) -> None:
+    """推送目标设备是否已连接（online/offline）。"""
+    status_text = "ONLINE" if is_present else "OFFLINE"
+    send_webhook_notification(f"[{ts()}]+{status_text}")
+    log_status(f"[{ts()}] 连接状态：{status_text}")
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +451,21 @@ def append_event_log(message: str) -> None:
         handle.write(message + "\n")
 
 
+def log_status(message: str) -> None:
+    try:
+        with STATUS_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+    except Exception as exc:
+        print(f"[{ts()}] 写入状态日志失败：{exc}")
+
+
+def log_program_exit(reason: str, notify: bool = True) -> None:
+    message = f"[{ts()}] 程序退出：{reason}"
+    log_status(message)
+    if notify:
+        send_webhook_notification(message)
+
+
 def check_target(devices: List[Dict[str, str]], last_state: Optional[bool]) -> Optional[bool]:
     online_device = next((device for device in devices if match_target(device)), None)
     online = online_device is not None
@@ -451,6 +475,7 @@ def check_target(devices: List[Dict[str, str]], last_state: Optional[bool]) -> O
             warn(f"[{ts()}] 目标初始在线，RSSI={online_device.get('rssi', '')}")
         else:
             print(f"[{ts()}] 目标初始离线")
+        notify_presence_change(online)
         return online
 
     if online != last_state:
@@ -459,6 +484,7 @@ def check_target(devices: List[Dict[str, str]], last_state: Optional[bool]) -> O
         message = f"[{ts()}] 目标设备{status_text}{rssi_info}"
         warn(message)
         append_event_log(message)
+        notify_presence_change(online)
 
     return online
 
@@ -543,36 +569,57 @@ def main() -> None:
         print(f"[INFO] 持续扫描已开启，每 {INTERVAL}s 一次。按 Ctrl+C 停止。")
         try:
             while True:
-                print(f"\n[{ts()}] 扫描中：{URL}")
-                current, new, gone, cookie = scan_once(prev_state, cookie)
+                try:
+                    print(f"\n[{ts()}] 扫描中：{URL}")
+                    current, new, gone, cookie = scan_once(prev_state, cookie)
 
-                print_table("当前在线设备", current)
-                print_table("新上线", new)
-                print_table("下线", gone)
-                render_target_status(current)
+                    print_table("当前在线设备", current)
+                    print_table("新上线", new)
+                    print_table("下线", gone)
+                    render_target_status(current)
 
-                if TARGET_MAC or TARGET_IP or TARGET_NAME_CONTAINS:
-                    target_last_state = check_target(current, target_last_state)
+                    if TARGET_MAC or TARGET_IP or TARGET_NAME_CONTAINS:
+                        target_last_state = check_target(current, target_last_state)
 
-                    current_online = is_target_online(current)
-                    if target_online_last is None:
-                        target_online_last = current_online
-                    elif current_online != target_online_last:
-                        notify_status_change(current_online)
-                        target_online_last = current_online
+                        current_online = is_target_online(current)
+                        if target_online_last is None:
+                            target_online_last = current_online
+                            initial_status = "UP" if current_online else "DOWN"
+                            log_status(f"[{ts()}] 状态初始化：{initial_status}")
+                        elif current_online != target_online_last:
+                            notify_status_change(current_online)
+                            target_online_last = current_online
 
-                time.sleep(INTERVAL)
+                    time.sleep(INTERVAL)
+                except Exception as loop_error:
+                    error_message = f"[{ts()}] 扫描异常：{loop_error}"
+                    warn(error_message)
+                    log_status(error_message)
+                    time.sleep(INTERVAL)
         except KeyboardInterrupt:
             print("\n[INFO] 已停止。")
+            log_program_exit("用户终止", notify=True)
+        except Exception as exc:
+            log_program_exit(f"异常退出：{exc}", notify=True)
+            raise
     else:
-        current, new, gone, _ = scan_once(prev_state, cookie)
-        print_table("当前在线设备", current)
-        print_table("新上线", new)
-        print_table("下线", gone)
-        render_target_status(current)
+        completed = False
+        try:
+            current, new, gone, _ = scan_once(prev_state, cookie)
+            print_table("当前在线设备", current)
+            print_table("新上线", new)
+            print_table("下线", gone)
+            render_target_status(current)
 
-        if TARGET_MAC or TARGET_IP or TARGET_NAME_CONTAINS:
-            check_target(current, None)
+            if TARGET_MAC or TARGET_IP or TARGET_NAME_CONTAINS:
+                check_target(current, None)
+            completed = True
+        except Exception as exc:
+            log_program_exit(f"异常退出：{exc}", notify=True)
+            raise
+        finally:
+            if completed:
+                log_program_exit("单次扫描完成", notify=False)
 
 
 if __name__ == "__main__":
